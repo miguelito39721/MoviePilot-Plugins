@@ -6,6 +6,7 @@ import asyncio
 import copy
 import hashlib
 import json
+import os
 import re
 import threading
 import time
@@ -34,6 +35,15 @@ SOURCE_AI = "ai"
 SOURCE_PEOPLE = "people"
 # 仅维护派生产物（NFO 文件、演员头像），不改动简介内容
 SOURCE_MAINTENANCE = "maintenance"
+
+# 状态文件治理：记录上限、外部查询缓存上限、落盘节流
+_RECORDS_MAX = 5000
+_CACHE_MAX = 3000
+_PERSON_IMAGE_MAX = 3000
+_CACHE_DAYS = 30
+_STATE_SAVE_INTERVAL = 5.0
+# 质量闸门判定为「中文占比过低」时用于区分可重试失败与素材缺失
+_UNTRANSLATED_PREFIX = "简介中文占比过低"
 
 # MusicBrainz：MV 没有 TMDB 演职员数据，团体成员只能取自这里
 MB_API = "https://musicbrainz.org/ws/2"
@@ -1493,6 +1503,9 @@ class OverviewEnhancer:
         self._stop_pending = threading.Event()
         self._skipped_no_provider = 0
         self._title_matched = 0
+        # 状态落盘节流：热点路径（头像/缓存）先标脏，最多每 5 秒落盘一次
+        self._last_save_at = 0.0
+        self._state_dirty = False
         # 单条重做/失败重试时只处理这些 key（server|item_id）
         self._focus_keys: set = set()
 
@@ -1509,6 +1522,9 @@ class OverviewEnhancer:
             "failures": {},
             "backups": {},
             "recent_episodes": {},
+            "person_images": {},
+            "skipped_untranslated": {},
+            "title_cache": {},
         }
         try:
             if self._state_file.exists():
@@ -1516,36 +1532,146 @@ class OverviewEnhancer:
                 if isinstance(data, dict):
                     default.update(data)
         except Exception as err:  # noqa: BLE001
-            logger.warning(f"影视简介增强：状态文件读取失败 {err}")
+            # 解析失败时保留损坏文件，避免下一次写入把唯一现场覆盖掉
+            self._quarantine_state_file()
+            logger.warning(f"影视简介增强：状态文件读取失败，已保留损坏副本：{err}")
         if not isinstance(default.get("records"), dict):
             default["records"] = {}
         if not isinstance(default.get("logs"), list):
             default["logs"] = []
         if not isinstance(default.get("daily"), dict):
             default["daily"] = {}
-        for key in ("failures", "backups", "recent_episodes"):
+        for key in (
+            "failures",
+            "backups",
+            "recent_episodes",
+            "person_images",
+            "skipped_untranslated",
+            "title_cache",
+        ):
             if not isinstance(default.get(key), dict):
                 default[key] = {}
         return default
 
+    def _quarantine_state_file(self) -> None:
+        """把无法解析的状态文件改名保留，避免被下一次写入覆盖。"""
+        try:
+            if not self._state_file.exists():
+                return
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            target = self._state_file.with_name(f"state.corrupt-{stamp}.json")
+            os.replace(self._state_file, target)
+            logger.warning(f"影视简介增强：损坏的状态文件已备份为 {target.name}")
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"影视简介增强：损坏状态文件备份失败 {err}")
+
     def _save_state(self, allow_stopped: bool = False) -> None:
-        """串行保存快照；旧引擎停止后仅允许 stop 保存最后一次状态。"""
+        """保存状态快照：锁内整理数据，锁外原子落盘，避免持锁做磁盘 IO。"""
         with self._lock:
             if self._stop_pending.is_set() and not allow_stopped:
                 return
-            self._state["records"] = dict(list(self._state.get("records", {}).items())[-20000:])
+            self._state["records"] = self._prune_records(self._state.get("records"))
             self._state["logs"] = list(self._state.get("logs", []))[-300:]
             failures = self._state.get("failures")
             if isinstance(failures, dict) and len(failures) > 500:
                 self._state["failures"] = dict(list(failures.items())[-500:])
             self._cleanup_backups()
+            self._cleanup_caches()
+            self._state["state_saved_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             payload = dict(self._state)
+            self._state_dirty = False
+            self._last_save_at = time.time()
+        text = json.dumps(payload, ensure_ascii=False, indent=2)
+        tmp_file = self._state_file.with_name(self._state_file.name + ".tmp")
+        try:
+            # 先写临时文件再原子替换：进程中断不会留下半截 JSON
+            tmp_file.write_text(text, encoding="utf-8")
+            os.replace(tmp_file, self._state_file)
+        except Exception as err:  # noqa: BLE001
+            logger.warning(f"影视简介增强：状态文件写入失败 {err}")
             try:
-                self._state_file.write_text(
-                    json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+                tmp_file.unlink()
+            except OSError:
+                pass
+
+    def _mark_dirty(self) -> None:
+        """标记状态需要落盘，配合 _flush_state 做节流写入。"""
+        self._state_dirty = True
+
+    def _flush_state(self, force: bool = False) -> None:
+        """按最小间隔节流落盘；force=True 时立即写盘。"""
+        if force:
+            self._save_state()
+            return
+        if not self._state_dirty:
+            return
+        if time.time() - self._last_save_at < _STATE_SAVE_INTERVAL:
+            return
+        self._save_state()
+
+    @staticmethod
+    def _prune_records(records: Any) -> Dict[str, Any]:
+        """只保留最近若干条处理记录，避免状态文件无限增长。"""
+        if not isinstance(records, dict):
+            return {}
+        if len(records) <= _RECORDS_MAX:
+            return dict(records)
+        ordered = sorted(
+            records.items(),
+            key=lambda item: (
+                str((item[1] or {}).get("time") or "")
+                if isinstance(item[1], dict)
+                else ""
+            ),
+        )
+        return dict(ordered[-_RECORDS_MAX:])
+
+    def _cleanup_caches(self) -> None:
+        """清理超期或超量的外部查询缓存（调用方需持有锁）。"""
+        now = time.time()
+        for key in ("skipped_untranslated", "title_cache"):
+            bucket = self._state.get(key)
+            if not isinstance(bucket, dict):
+                self._state[key] = {}
+                continue
+            for name, entry in list(bucket.items()):
+                stamp = 0.0
+                if isinstance(entry, dict):
+                    try:
+                        stamp = float(entry.get("ts") or 0)
+                    except (TypeError, ValueError):
+                        stamp = 0.0
+                if stamp and stamp < now - _CACHE_DAYS * 86400:
+                    bucket.pop(name, None)
+            if len(bucket) > _CACHE_MAX:
+                ordered = sorted(
+                    bucket.items(),
+                    key=lambda item: (
+                        float((item[1] or {}).get("ts") or 0)
+                        if isinstance(item[1], dict)
+                        else 0
+                    ),
                 )
-            except Exception as err:  # noqa: BLE001
-                logger.warning(f"影视简介增强：状态文件写入失败 {err}")
+                for name, _ in ordered[: len(bucket) - _CACHE_MAX]:
+                    bucket.pop(name, None)
+        images = self._state.get("person_images")
+        if isinstance(images, dict) and len(images) > _PERSON_IMAGE_MAX:
+            for name in list(images)[: len(images) - _PERSON_IMAGE_MAX]:
+                images.pop(name, None)
+
+    def _state_size(self) -> int:
+        """返回状态文件字节数，供详情页展示体积占用。"""
+        try:
+            return int(self._state_file.stat().st_size)
+        except OSError:
+            return 0
+
+    def _last_error(self) -> str:
+        """返回最近一条错误日志内容，便于快速定位问题。"""
+        for entry in reversed(self._state.get("logs") or []):
+            if isinstance(entry, dict) and entry.get("level") == "error":
+                return str(entry.get("message") or "")
+        return ""
 
     def _cleanup_backups(self) -> None:
         """清理超过保留天数或条数上限的旧简介备份（调用方需持有锁）。"""
@@ -1652,6 +1778,10 @@ class OverviewEnhancer:
             "processed_total": len(records),
             "failure_count": len(failures),
             "backup_count": len(backups),
+            "skipped_untranslated": len(self._state.get("skipped_untranslated") or {}),
+            "state_bytes": self._state_size(),
+            "state_saved_at": self._state.get("state_saved_at"),
+            "last_error": self._last_error(),
             "failures": failure_rows,
             "backups": backup_rows,
             "stats": self._state.get("stats") or {},
@@ -1690,13 +1820,21 @@ class OverviewEnhancer:
             daily = self._state.get("daily")
             today = datetime.now().strftime("%Y-%m-%d")
             if not isinstance(daily, dict) or daily.get("date") != today:
-                daily = {"date": today, "updated": 0, "skipped": 0, "failed": 0, "runs": 0}
+                daily = {
+                    "date": today,
+                    "updated": 0,
+                    "skipped": 0,
+                    "failed": 0,
+                    "untranslated": 0,
+                    "runs": 0,
+                }
                 self._state["daily"] = daily
             return {
                 "date": today,
                 "updated": int(daily.get("updated") or 0),
                 "skipped": int(daily.get("skipped") or 0),
                 "failed": int(daily.get("failed") or 0),
+                "untranslated": int(daily.get("untranslated") or 0),
                 "runs": int(daily.get("runs") or 0),
             }
 
@@ -1705,12 +1843,23 @@ class OverviewEnhancer:
         if not self._config.get("notify_daily"):
             return {"sent": False, "message": "每日汇总通知未开启"}
         stats = self.daily_stats()
-        if not (stats["updated"] or stats["skipped"] or stats["failed"] or stats["runs"]):
+        if not (
+            stats["updated"]
+            or stats["skipped"]
+            or stats["failed"]
+            or stats.get("untranslated")
+            or stats["runs"]
+        ):
             return {"sent": False, "message": "今天还没有处理记录"}
         text = (
             f"今日汇总：成功更新 {stats['updated']} 条，跳过 {stats['skipped']} 条，"
             f"失败 {stats['failed']} 条（共 {stats['runs']} 轮任务）"
         )
+        if stats.get("untranslated"):
+            text += (
+                f"\n其中 {stats['untranslated']} 条因素材缺中文未写回，"
+                "已记入放弃清单，不再重复消耗 AI"
+            )
         failed_titles = self._failed_titles(5)
         if failed_titles:
             text += "\n失败条目：\n" + "\n".join(f"· {item}" for item in failed_titles)
@@ -1816,6 +1965,73 @@ class OverviewEnhancer:
                 index[item_id] = item
         return index
 
+    def _untranslated_skipped(self, key: str, current: str) -> bool:
+        """该条目此前判定为中文缺失而放弃，且简介未变化时不再重复消耗 AI。"""
+        bucket = self._state.get("skipped_untranslated")
+        if not isinstance(bucket, dict):
+            return False
+        entry = bucket.get(key)
+        if not isinstance(entry, dict):
+            return False
+        return str(entry.get("sig") or "") == text_signature(current)
+
+    def _cached_title_match(
+        self, cache_key: str, matcher: Callable[[], Tuple[Optional[int], str]]
+    ) -> Optional[int]:
+        """TMDB 标题匹配缓存：正负结果都保留，避免每轮重复请求。"""
+        with self._lock:
+            cache = self._state.get("title_cache")
+            if not isinstance(cache, dict):
+                cache = {}
+                self._state["title_cache"] = cache
+            entry = cache.get(cache_key)
+            if isinstance(entry, dict) and "id" in entry:
+                cached = int(entry.get("id") or 0)
+                if cached:
+                    self._title_matched += 1
+                return cached or None
+        matched_id, matched_name = matcher()
+        with self._lock:
+            self._state.setdefault("title_cache", {})[cache_key] = {
+                "id": int(matched_id or 0),
+                "name": str(matched_name or ""),
+                "ts": time.time(),
+            }
+        self._mark_dirty()
+        if matched_id:
+            self._title_matched += 1
+        return matched_id or None
+
+    def _cached_movie_match(self, name: str, year: str) -> Optional[int]:
+        """按标题匹配电影 TMDB ID（带持久缓存）。"""
+        cache_key = f"movie|{_normalize_title(name)}|{year}"
+
+        def _matcher() -> Tuple[Optional[int], str]:
+            matched_id, matched_name = self._tmdb.match_movie_id(name, year)
+            if matched_id:
+                self._log(
+                    f"电影「{name}」无 TMDB 标识，按标题匹配到「{matched_name}」"
+                    f"（tmdb={matched_id}）"
+                )
+            return matched_id, matched_name
+
+        return self._cached_title_match(cache_key, _matcher)
+
+    def _cached_tv_match(self, title: str, year: str, season: int) -> Optional[int]:
+        """按标题匹配剧集 TMDB ID（带持久缓存，季参与缓存键）。"""
+        cache_key = f"tv|{_normalize_title(title)}|{year}|{season}"
+
+        def _matcher() -> Tuple[Optional[int], str]:
+            matched_id, matched_name = self._tmdb.match_tv_id(title, year, season=season)
+            if matched_id:
+                self._log(
+                    f"「{title}」无 TMDB 标识，按标题匹配到「{matched_name}」"
+                    f"（tmdb={matched_id}）"
+                )
+            return matched_id, matched_name
+
+        return self._cached_title_match(cache_key, _matcher)
+
     def _build_movie_jobs(
         self,
         client: EmbyClient,
@@ -1833,6 +2049,13 @@ class OverviewEnhancer:
             focus = f"{client.name}|{item_id}" in self._focus_keys
             current = self._overview_of(item)
             current_len = visible_length(current)
+            if (
+                not force
+                and not focus
+                and self._untranslated_skipped(f"{client.name}|{item_id}", current)
+            ):
+                # 已判定中文缺失且简介未变化：跳过，避免每轮重复生成与翻译
+                continue
             if not force and not focus and current_len >= min_chars:
                 continue
             name = str(item.get("Name") or "")
@@ -1840,14 +2063,7 @@ class OverviewEnhancer:
             if require_provider:
                 tmdb_id = self._tmdb_provider_id(item)
                 if not tmdb_id and self._config.get("tmdb_title_fallback"):
-                    matched_id, matched_name = self._tmdb.match_movie_id(name, year)
-                    if matched_id:
-                        tmdb_id = matched_id
-                        self._title_matched += 1
-                        self._log(
-                            f"电影「{name}」无 TMDB 标识，按标题匹配到「{matched_name}」"
-                            f"（tmdb={matched_id}）"
-                        )
+                    tmdb_id = self._cached_movie_match(name, year)
             else:
                 tmdb_id = self._tmdb_id_of(item, MOVIE, name, year)
             if not tmdb_id:
@@ -2016,16 +2232,7 @@ class OverviewEnhancer:
             if require_provider:
                 tmdb_id = self._tmdb_provider_id(series_item)
                 if not tmdb_id and self._config.get("tmdb_title_fallback"):
-                    matched_id, matched_name = self._tmdb.match_tv_id(
-                        series_title, series_year, season=season
-                    )
-                    if matched_id:
-                        tmdb_id = matched_id
-                        self._title_matched += 1
-                        self._log(
-                            f"「{series_title}」无 TMDB 标识，按标题匹配到「{matched_name}」"
-                            f"（tmdb={matched_id}）"
-                        )
+                    tmdb_id = self._cached_tv_match(series_title, series_year, season)
             else:
                 tmdb_id = self._tmdb_id_of(series_item, EPISODE, series_title, series_year)
             if not tmdb_id:
@@ -2049,6 +2256,13 @@ class OverviewEnhancer:
                 focus = f"{client.name}|{item_id}" in self._focus_keys
                 current = self._overview_of(item)
                 current_len = visible_length(current)
+                if (
+                    not force
+                    and not focus
+                    and self._untranslated_skipped(f"{client.name}|{item_id}", current)
+                ):
+                    # 已判定中文缺失且简介未变化：跳过，避免每轮重复生成与翻译
+                    continue
                 duplicated = current_len >= 10 and text_signature(current) in duplicate_values
                 if (
                     not force
@@ -2539,7 +2753,9 @@ class OverviewEnhancer:
                 url = ""
         with self._lock:
             self._state.setdefault("person_images", {})[key] = url
-        self._save_state()
+        # 头像查询可能很密集，只标脏并节流落盘，避免每次查询都写整份状态
+        self._mark_dirty()
+        self._flush_state()
         return url
 
     def _ensure_avatars(
@@ -3292,6 +3508,8 @@ class OverviewEnhancer:
                     self._run["failed"] = int(self._run.get("failed") or 0) + 1
                 else:
                     self._run["skipped"] = int(self._run.get("skipped") or 0) + 1
+                if result.get("untranslated"):
+                    self._run["untranslated"] = int(self._run.get("untranslated") or 0) + 1
                 label = str(job.get("title") or "")
                 if job.get("kind") == EPISODE:
                     label = f"{label} S{job.get('season')}E{job.get('episode')}"
@@ -3304,6 +3522,9 @@ class OverviewEnhancer:
             key = str(job.get("key") or "")
             if status == "updated":
                 failures.pop(key, None)
+                skipped_cache = self._state.get("skipped_untranslated")
+                if isinstance(skipped_cache, dict):
+                    skipped_cache.pop(key, None)
                 self._state.setdefault("records", {})[key] = {
                     "hash": text_signature(result.get("text")),
                     "time": now,
@@ -3338,6 +3559,15 @@ class OverviewEnhancer:
                     "count": int(previous.get("count") or 0) + 1,
                     "job": dict(job),
                 }
+            elif result.get("untranslated"):
+                # 中文缺失止损：记录当前简介指纹，简介未变化时不再重复生成
+                self._state.setdefault("skipped_untranslated", {})[key] = {
+                    "sig": text_signature(job.get("current")),
+                    "message": str(result.get("message") or ""),
+                    "time": now,
+                    "ts": time.time(),
+                }
+                self._bump_daily("untranslated")
         if status == "failed":
             self._log(f"{job.get('title')} {job.get('item_id')} 处理失败：{result.get('message')}", "error")
 
@@ -3346,9 +3576,16 @@ class OverviewEnhancer:
         daily = self._state.get("daily")
         today = datetime.now().strftime("%Y-%m-%d")
         if not isinstance(daily, dict) or daily.get("date") != today:
-            daily = {"date": today, "updated": 0, "skipped": 0, "failed": 0, "runs": 0}
+            daily = {
+                "date": today,
+                "updated": 0,
+                "skipped": 0,
+                "failed": 0,
+                "untranslated": 0,
+                "runs": 0,
+            }
             self._state["daily"] = daily
-        key = status if status in {"updated", "skipped", "failed"} else "skipped"
+        key = status if status in {"updated", "skipped", "failed", "untranslated"} else "skipped"
         daily[key] = int(daily.get(key) or 0) + 1
 
     def _finish_run(self, message: str, stats: Dict[str, Any]) -> None:
@@ -3366,8 +3603,18 @@ class OverviewEnhancer:
                 )
                 summary = dict(self._run)
                 daily = self._state.get("daily")
-                if isinstance(daily, dict):
-                    daily["runs"] = int(daily.get("runs") or 0) + 1
+                today = datetime.now().strftime("%Y-%m-%d")
+                if not isinstance(daily, dict) or daily.get("date") != today:
+                    daily = {
+                        "date": today,
+                        "updated": 0,
+                        "skipped": 0,
+                        "failed": 0,
+                        "untranslated": 0,
+                        "runs": 0,
+                    }
+                    self._state["daily"] = daily
+                daily["runs"] = int(daily.get("runs") or 0) + 1
             else:
                 summary = {}
             self._state["last_run"] = summary
@@ -3392,6 +3639,12 @@ class OverviewEnhancer:
         detail = f"{message}\n服务器：{servers}"
         if source_text:
             detail += f"\n来源：{source_text}"
+        skipped_ai = int(summary.get("untranslated") or 0)
+        if skipped_ai:
+            detail += (
+                f"\n其中 {skipped_ai} 条因素材缺中文已记入放弃清单"
+                "（简介变化或强制重写时才会再试）"
+            )
         if self._config.get("notify") and self._notify is not None:
             try:
                 self._notify("影视简介增强", detail)
@@ -3448,6 +3701,10 @@ class OverviewEnhancer:
             text = clean_text(strip_technical_sentences(text), 4000)
             issue = self._quality_issue(text, str(job.get("kind") or ""))
             if issue:
+                if issue.startswith(_UNTRANSLATED_PREFIX):
+                    # 素材本身没有中文且翻译失败：记为「中文缺失跳过」并写入止损缓存，
+                    # 避免每轮扫描重复调用 AI 翻译
+                    return {"status": "skipped", "message": issue, "untranslated": True}
                 return {"status": "failed", "message": issue}
         if not maintenance and text_signature(text) == text_signature(job.get("current")):
             return {"status": "skipped", "message": "内容与现有简介一致"}
