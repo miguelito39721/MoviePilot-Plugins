@@ -885,14 +885,16 @@ class SeedStats(_PluginBase):
         """判定站点行的健康状态文本。"""
         if row.get("_unknown_tracker"):
             return "未映射"
-        # 用「做种数」而不是「任务数」判定：任务全暂停/全在下载的站点同样是零做种
-        if not row.get("做种"):
-            return _STATUS_IDLE
+        # 过期优先：账户数据长时间未更新时先提示过期，避免把「数据旧」误判成「没做种」
         updated_ts = float(row.get("_updated_ts") or 0)
         if updated_ts > 0:
             age_hours = (time.time() - updated_ts) / 3600
             if age_hours > self._stale_hours:
                 return _STATUS_STALE
+        # 用「做种数」判定零做种：任务全暂停/全在下载的站点同样是零做种；
+        # 行里没有做种字段时退回按任务数判定，保持旧口径兼容
+        if row.get("做种") == 0 or not row.get("任务数"):
+            return _STATUS_IDLE
         return _STATUS_OK
 
     def __build_alerts(self, rows: List[Dict[str, Any]],
