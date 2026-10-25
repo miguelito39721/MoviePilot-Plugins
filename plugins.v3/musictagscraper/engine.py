@@ -9,6 +9,7 @@ import difflib
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from datetime import datetime
@@ -29,6 +30,8 @@ from app.domain.context import MusicInfo, MusicLyrics
 from app.domain.meta.metamusic import MetaMusic
 from app.sdk.logging import logger
 from app.sdk.network import RequestUtils
+
+from .dedupe import DUPLICATE_MODES, find_duplicates
 
 # 支持的音频后缀
 AUDIO_EXTENSIONS = {
@@ -73,6 +76,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "notify": True,
     "show_sidebar_nav": True,
     "dashboard": True,
+    "dedupe_modes": ["exact", "same_track"],
+    "quarantine_dir": "",
 }
 
 # 来源名称到处理链的映射
@@ -134,6 +139,9 @@ def normalize_config(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         if item.lower() in FOLDER_COVER_CHOICES
     ]
     data["folder_cover_names"] = list(dict.fromkeys(cover_names)) or list(DEFAULT_CONFIG["folder_cover_names"])
+    dedupe_modes = [item for item in _as_str_list(data.get("dedupe_modes")) if item in DUPLICATE_MODES]
+    data["dedupe_modes"] = list(dict.fromkeys(dedupe_modes)) or list(DEFAULT_CONFIG["dedupe_modes"])
+    data["quarantine_dir"] = str(data.get("quarantine_dir") or "").strip()
     data["min_score"] = _bounded_float(data.get("min_score"), 0.62, 0.3, 1.0)
     data["concurrency"] = _bounded_int(data.get("concurrency"), 2, 1, 8)
     data["max_files_per_run"] = _bounded_int(data.get("max_files_per_run"), 200, 1, 2000)
@@ -296,6 +304,11 @@ class MusicTagEngine:
         self._cover_cache: Dict[str, Optional[bytes]] = {}
         # 单轮内已完成目录封面的目录集合，避免并发重复写同一专辑
         self._cover_dirs_done: set[str] = set()
+        # 查重为后台任务：结果与进度单独保存，避免大库扫描阻塞页面请求
+        self._dedupe_lock = threading.Lock()
+        self._dedupe_thread: Optional[threading.Thread] = None
+        self._dedupe_run: Dict[str, Any] = {}
+        self._dedupe_result: Dict[str, Any] = {}
 
     # ------------------------------------------------------------------ 状态
 
@@ -306,6 +319,7 @@ class MusicTagEngine:
             "records": {},
             "failures": {},
             "cover_dirs": {},
+            "quarantine": {},
             "logs": [],
             "last_run": None,
             "stats": {},
@@ -317,7 +331,7 @@ class MusicTagEngine:
                     default.update(data)
         except Exception as err:  # noqa: BLE001
             logger.warning(f"音乐标签刮削：状态文件读取失败：{err}")
-        for key in ("records", "failures", "cover_dirs"):
+        for key in ("records", "failures", "cover_dirs", "quarantine"):
             if not isinstance(default.get(key), dict):
                 default[key] = {}
         if not isinstance(default.get("logs"), list):
@@ -334,6 +348,9 @@ class MusicTagEngine:
             cover_dirs = self._state.get("cover_dirs")
             if isinstance(cover_dirs, dict) and len(cover_dirs) > 3000:
                 self._state["cover_dirs"] = dict(list(cover_dirs.items())[-3000:])
+            quarantine = self._state.get("quarantine")
+            if isinstance(quarantine, dict) and len(quarantine) > 5000:
+                self._state["quarantine"] = dict(list(quarantine.items())[-5000:])
             payload = dict(self._state)
         text = json.dumps(payload, ensure_ascii=False, indent=2)
         tmp = self._state_file.with_name(f"{self._state_file.name}.{os.getpid()}.tmp")
@@ -363,6 +380,8 @@ class MusicTagEngine:
             records = dict(self._state.get("records") or {})
             failures = dict(self._state.get("failures") or {})
             cover_dirs = dict(self._state.get("cover_dirs") or {})
+            quarantine = dict(self._state.get("quarantine") or {})
+            dedupe = dict(self._state.get("dedupe") or {})
             logs = list(self._state.get("logs") or [])[-40:]
             stats = dict(self._state.get("stats") or {})
             last_run = self._state.get("last_run")
@@ -381,6 +400,13 @@ class MusicTagEngine:
             "processed_total": len(records),
             "failure_count": len(failures),
             "cover_dir_count": len(cover_dirs),
+            "quarantined_count": len(quarantine),
+            "quarantined_bytes": sum(
+                int((item or {}).get("size") or 0)
+                for item in quarantine.values() if isinstance(item, dict)
+            ),
+            "dedupe": dedupe,
+            "dedupe_running": bool(self._dedupe_thread is not None and self._dedupe_thread.is_alive()),
             "today": self._today_stats(records),
             "failures": failure_rows,
             "logs": logs,
@@ -429,6 +455,10 @@ class MusicTagEngine:
     def _iter_audio_files(self, dirs: List[str], excludes: List[str]) -> List[Path]:
         """遍历配置目录下的音频文件。"""
         excluded = [Path(item).expanduser() for item in excludes]
+        # 隔离目录可能位于音乐库同级或内部，始终不参与扫描
+        quarantine = self.quarantine_root()
+        if quarantine is not None:
+            excluded.append(quarantine)
         results: List[Path] = []
         for raw in dirs:
             root = Path(raw).expanduser()
@@ -1134,17 +1164,202 @@ class MusicTagEngine:
         self._save_state()
         return {"cleared": count, "failures": failed}
 
+    # -------------------------------------------------------------- 重复检测
+
+    def quarantine_root(self) -> Optional[Path]:
+        """返回重复文件隔离目录：未配置时落在首个音乐目录同级，保证同一文件系统。"""
+        configured = str(self._config.get("quarantine_dir") or "").strip()
+        if configured:
+            return Path(configured).expanduser()
+        roots = [Path(item).expanduser() for item in (self._config.get("music_dirs") or [])]
+        if not roots:
+            return None
+        return roots[0].parent / ".musictagscraper-duplicates"
+
+    def _music_root_of(self, path: Path) -> Optional[Path]:
+        """返回包含该文件且最贴近的音乐根目录。"""
+        matched: Optional[Path] = None
+        for item in self._config.get("music_dirs") or []:
+            root = Path(item).expanduser()
+            try:
+                path.relative_to(root)
+            except ValueError:
+                continue
+            if matched is None or len(str(root)) > len(str(matched)):
+                matched = root
+        return matched
+
+    def detect_duplicates(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """扫描音乐目录并返回重复分组（只读，不移动任何文件）。"""
+        payload = payload or {}
+        dirs = _as_str_list(payload.get("music_dirs")) or list(self._config.get("music_dirs") or [])
+        modes = [str(item) for item in _as_str_list(payload.get("modes")) if item in DUPLICATE_MODES]
+        modes = modes or list(self._config.get("dedupe_modes") or [DUPLICATE_MODES[0]])
+        limit = _bounded_int(payload.get("limit"), 5000, 1, 20000)
+        files = self._iter_audio_files(dirs, list(self._config.get("exclude_dirs") or []))
+        result = find_duplicates(files, AudioMetadataHelper.read, modes=modes, limit=limit)
+        result["stats"]["dirs"] = dirs
+        result["stats"]["quarantine_dir"] = str(self.quarantine_root() or "")
+        with self._lock:
+            self._state["dedupe"] = {
+                "time": _now_text(),
+                "stats": dict(result["stats"]),
+            }
+        self._save_state()
+        return result
+
+    def start_dedupe(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """在后台启动查重任务，避免大音乐库扫描阻塞页面。"""
+        with self._dedupe_lock:
+            if self._dedupe_thread is not None and self._dedupe_thread.is_alive():
+                return {"started": False, "running": True, "message": "查重正在进行"}
+            payload = dict(payload or {})
+            self._dedupe_run = {
+                "state": "running",
+                "started_at": _now_text(),
+                "message": "正在扫描音乐目录…",
+            }
+
+            def worker() -> None:
+                """执行后台查重并保存结果。"""
+                try:
+                    result = self.detect_duplicates(payload)
+                except Exception as err:  # noqa: BLE001
+                    logger.error(f"音乐标签刮削：后台查重失败：{err}", exc_info=True)
+                    with self._dedupe_lock:
+                        self._dedupe_run = {"state": "failed", "message": str(err)}
+                    return
+                with self._dedupe_lock:
+                    self._dedupe_result = result
+                    self._dedupe_run = {
+                        "state": "finished",
+                        "started_at": self._dedupe_run.get("started_at"),
+                        "finished_at": _now_text(),
+                        "message": (
+                            f"扫描 {result['stats'].get('scanned', 0)} 个音频，"
+                            f"发现 {result['stats'].get('groups', 0)} 组重复"
+                        ),
+                    }
+
+            self._dedupe_thread = threading.Thread(target=worker, daemon=True)
+            self._dedupe_thread.start()
+        return {"started": True, "running": True, "message": "查重已开始"}
+
+    def dedupe_snapshot(self) -> Dict[str, Any]:
+        """返回查重任务状态与最近一次结果。"""
+        with self._dedupe_lock:
+            thread = self._dedupe_thread
+            running = bool(thread is not None and thread.is_alive())
+            run = dict(self._dedupe_run)
+            result = dict(self._dedupe_result)
+        if running:
+            run["state"] = "running"
+        return {"running": running, "run": run, "result": result}
+
+    def quarantine_files(self, paths: List[str]) -> Dict[str, Any]:
+        """把选中的重复文件移入隔离目录，保留相对路径并记录可还原信息。"""
+        root = self.quarantine_root()
+        if root is None:
+            return {"moved": 0, "failed": [], "message": "未配置音乐目录，无法确定隔离位置"}
+        moved: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        for raw in paths or []:
+            source = Path(str(raw or "")).expanduser()
+            if not source.is_file():
+                failed.append({"path": str(source), "reason": "文件不存在"})
+                continue
+            music_root = self._music_root_of(source)
+            if music_root is None:
+                failed.append({"path": str(source), "reason": "不在配置的音乐目录内"})
+                continue
+            try:
+                relative = source.relative_to(music_root)
+            except ValueError:
+                failed.append({"path": str(source), "reason": "无法计算相对路径"})
+                continue
+            target = root / relative
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if target.exists():
+                    stem, suffix = target.stem, target.suffix
+                    index = 1
+                    while target.exists():
+                        target = target.with_name(f"{stem}.dup{index}{suffix}")
+                        index += 1
+                size = source.stat().st_size
+                shutil.move(str(source), str(target))
+            except Exception as err:  # noqa: BLE001
+                logger.warning(f"音乐标签刮削：隔离重复文件失败 {source} - {err}")
+                failed.append({"path": str(source), "reason": str(err)})
+                continue
+            with self._lock:
+                self._state.setdefault("quarantine", {})[str(target)] = {
+                    "origin": str(source),
+                    "time": _now_text(),
+                    "size": size,
+                }
+            moved.append({"origin": str(source), "target": str(target), "size": size})
+        if moved:
+            self._save_state()
+            self._log(f"重复隔离：移动 {len(moved)} 个文件到 {root}")
+        return {
+            "moved": len(moved),
+            "moved_bytes": sum(item["size"] for item in moved),
+            "failed": failed,
+            "quarantine_dir": str(root),
+            "items": moved,
+        }
+
+    def restore_quarantine(self, paths: Optional[List[str]] = None) -> Dict[str, Any]:
+        """把隔离目录中的文件还原到原路径。"""
+        picked = [str(item) for item in (paths or []) if str(item or "").strip()]
+        with self._lock:
+            records = dict(self._state.get("quarantine") or {})
+            targets = picked or list(records)
+        restored: List[Dict[str, Any]] = []
+        failed: List[Dict[str, Any]] = []
+        for raw in targets:
+            record = records.get(raw)
+            if not isinstance(record, dict):
+                failed.append({"path": raw, "reason": "没有隔离记录"})
+                continue
+            source = Path(raw)
+            origin = Path(str(record.get("origin") or ""))
+            if not source.is_file():
+                failed.append({"path": raw, "reason": "隔离文件不存在"})
+                continue
+            if origin.exists():
+                failed.append({"path": raw, "reason": "原位置已有同名文件"})
+                continue
+            try:
+                origin.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(str(source), str(origin))
+            except Exception as err:  # noqa: BLE001
+                failed.append({"path": raw, "reason": str(err)})
+                continue
+            with self._lock:
+                self._state.setdefault("quarantine", {}).pop(raw, None)
+            restored.append({"origin": str(origin), "from": raw})
+        if restored:
+            self._save_state()
+            self._log(f"重复还原：恢复 {len(restored)} 个文件")
+        return {"restored": len(restored), "failed": failed, "items": restored}
+
     def dashboard_stats(self) -> Dict[str, Any]:
         """汇总首页仪表板需要的今日与最近批次数据。"""
         with self._lock:
             records = dict(self._state.get("records") or {})
             failures = dict(self._state.get("failures") or {})
+            quarantine = dict(self._state.get("quarantine") or {})
+            dedupe = dict(self._state.get("dedupe") or {})
             last_run = dict(self._state.get("last_run") or {})
         run = dict(self._run or {})
         return {
             "today": self._today_stats(records),
             "processed_total": len(records),
             "failure_count": len(failures),
+            "quarantined_count": len(quarantine),
+            "dedupe": dedupe.get("stats") if isinstance(dedupe.get("stats"), dict) else {},
             "last_run": last_run,
             "running": bool(run.get("state") == "running"),
             "run": run,

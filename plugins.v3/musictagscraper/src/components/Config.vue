@@ -29,6 +29,8 @@ const DEFAULTS = {
   notify: true,
   show_sidebar_nav: true,
   dashboard: true,
+  dedupe_modes: ['exact', 'same_track'],
+  quarantine_dir: '',
 }
 
 const base = computed(() => `plugin/${props.pluginId || 'MusicTagScraper'}`)
@@ -46,6 +48,11 @@ const sourceItems = [
 const coverNameItems = [
   { title: 'cover.jpg（Navidrome / 群晖）', value: 'cover.jpg' },
   { title: 'folder.jpg（Windows / 飞牛）', value: 'folder.jpg' },
+]
+
+const dedupeModeItems = [
+  { title: '完全重复（文件内容一致）', value: 'exact' },
+  { title: '同曲多版本（曲名 + 艺人 + 时长）', value: 'same_track' },
 ]
 
 function unwrap(response) {
@@ -96,6 +103,8 @@ async function save() {
       exclude_dirs: toList(excludeText.value),
       sources: (config.value.sources || []).filter(Boolean),
       folder_cover_names: (config.value.folder_cover_names || []).filter(Boolean),
+      dedupe_modes: (config.value.dedupe_modes || []).filter(Boolean),
+      quarantine_dir: String(config.value.quarantine_dir || '').trim(),
       concurrency: Number(config.value.concurrency || 2),
       max_files_per_run: Number(config.value.max_files_per_run || 200),
       schedule_hours: Number(config.value.schedule_hours || 0),
@@ -241,6 +250,31 @@ onMounted(loadConfig)
           />
         </VCol>
       </VRow>
+
+      <VDivider class="my-3" />
+      <div class="text-subtitle-2 mb-2">重复检测</div>
+      <div class="text-caption text-medium-emphasis mb-1">检测方式（可多选）</div>
+      <VCheckboxBtn
+        v-for="item in dedupeModeItems"
+        :key="item.value"
+        v-model="config.dedupe_modes"
+        :label="item.title"
+        :value="item.value"
+        color="primary"
+        inline
+      />
+      <VTextField
+        v-model="config.quarantine_dir"
+        label="重复文件隔离目录（留空=音乐目录同级的 .musictagscraper-duplicates）"
+        density="comfortable"
+        variant="outlined"
+        hide-details
+        class="mt-2"
+      />
+      <VAlert type="info" variant="tonal" density="compact" class="mt-2">
+        查重只做盘点，不会自动删除文件；勾选后才会移动到隔离目录，保留原相对路径，可随时一键还原。
+        建议隔离目录与音乐目录在同一磁盘，避免跨盘搬移。
+      </VAlert>
 
       <VAlert type="info" variant="tonal" density="compact" class="mt-4">
         插件只写音频文件的标签与同名 .lrc 歌词，不重命名、不移动、不删除；默认「只补空缺」，

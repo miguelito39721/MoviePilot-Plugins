@@ -1,5 +1,5 @@
 import { importShared } from './__federation_fn_import-JrT3xvdd.js';
-import { P as Panel } from './Panel-YdzmuVr7.js';
+import { P as Panel } from './Panel-DP2CfRiy.js';
 
 const {openBlock:_openBlock,createBlock:_createBlock} = await importShared('vue');
 

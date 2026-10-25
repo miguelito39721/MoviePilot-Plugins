@@ -44,6 +44,8 @@ const DEFAULTS = {
   notify: true,
   show_sidebar_nav: true,
   dashboard: true,
+  dedupe_modes: ['exact', 'same_track'],
+  quarantine_dir: '',
 };
 
 const base = computed(() => `plugin/${props.pluginId || 'MusicTagScraper'}`);
@@ -61,6 +63,11 @@ const sourceItems = [
 const coverNameItems = [
   { title: 'cover.jpg（Navidrome / 群晖）', value: 'cover.jpg' },
   { title: 'folder.jpg（Windows / 飞牛）', value: 'folder.jpg' },
+];
+
+const dedupeModeItems = [
+  { title: '完全重复（文件内容一致）', value: 'exact' },
+  { title: '同曲多版本（曲名 + 艺人 + 时长）', value: 'same_track' },
 ];
 
 function unwrap(response) {
@@ -111,6 +118,8 @@ async function save() {
       exclude_dirs: toList(excludeText.value),
       sources: (config.value.sources || []).filter(Boolean),
       folder_cover_names: (config.value.folder_cover_names || []).filter(Boolean),
+      dedupe_modes: (config.value.dedupe_modes || []).filter(Boolean),
+      quarantine_dir: String(config.value.quarantine_dir || '').trim(),
       concurrency: Number(config.value.concurrency || 2),
       max_files_per_run: Number(config.value.max_files_per_run || 200),
       schedule_hours: Number(config.value.schedule_hours || 0),
@@ -204,7 +213,7 @@ return (_ctx, _cache) => {
             "persistent-hint": "",
             class: "mb-3"
           }, null, 8, ["modelValue"]),
-          _cache[24] || (_cache[24] = _createElementVNode("div", { class: "text-subtitle-2 mb-2" }, "元数据来源（按顺序回退）", -1)),
+          _cache[27] || (_cache[27] = _createElementVNode("div", { class: "text-subtitle-2 mb-2" }, "元数据来源（按顺序回退）", -1)),
           (_openBlock(), _createElementBlock(_Fragment, null, _renderList(sourceItems, (item) => {
             return _createVNode(_component_VCheckboxBtn, {
               key: item.value,
@@ -282,7 +291,7 @@ return (_ctx, _cache) => {
             ]),
             _: 1
           }),
-          _cache[25] || (_cache[25] = _createElementVNode("div", { class: "text-caption text-medium-emphasis mt-3 mb-1" }, "目录封面文件名（可多选）", -1)),
+          _cache[28] || (_cache[28] = _createElementVNode("div", { class: "text-caption text-medium-emphasis mt-3 mb-1" }, "目录封面文件名（可多选）", -1)),
           (_openBlock(), _createElementBlock(_Fragment, null, _renderList(coverNameItems, (item) => {
             return _createVNode(_component_VCheckboxBtn, {
               key: item.value,
@@ -300,7 +309,7 @@ return (_ctx, _cache) => {
             density: "compact",
             class: "mt-2 mb-1"
           }, {
-            default: _withCtx(() => [...(_cache[20] || (_cache[20] = [
+            default: _withCtx(() => [...(_cache[22] || (_cache[22] = [
               _createTextVNode(" 目录封面只在专辑目录没有 cover/folder 图片时补写：优先在线封面，缺失时从音频内嵌封面提取， 不覆盖已有图片（除非勾选「覆盖已有标签」）。 ", -1)
             ]))]),
             _: 1
@@ -473,13 +482,47 @@ return (_ctx, _cache) => {
             ]),
             _: 1
           }),
+          _createVNode(_component_VDivider, { class: "my-3" }),
+          _cache[29] || (_cache[29] = _createElementVNode("div", { class: "text-subtitle-2 mb-2" }, "重复检测", -1)),
+          _cache[30] || (_cache[30] = _createElementVNode("div", { class: "text-caption text-medium-emphasis mb-1" }, "检测方式（可多选）", -1)),
+          (_openBlock(), _createElementBlock(_Fragment, null, _renderList(dedupeModeItems, (item) => {
+            return _createVNode(_component_VCheckboxBtn, {
+              key: item.value,
+              modelValue: config.value.dedupe_modes,
+              "onUpdate:modelValue": _cache[19] || (_cache[19] = $event => ((config.value.dedupe_modes) = $event)),
+              label: item.title,
+              value: item.value,
+              color: "primary",
+              inline: ""
+            }, null, 8, ["modelValue", "label", "value"])
+          }), 64)),
+          _createVNode(_component_VTextField, {
+            modelValue: config.value.quarantine_dir,
+            "onUpdate:modelValue": _cache[20] || (_cache[20] = $event => ((config.value.quarantine_dir) = $event)),
+            label: "重复文件隔离目录（留空=音乐目录同级的 .musictagscraper-duplicates）",
+            density: "comfortable",
+            variant: "outlined",
+            "hide-details": "",
+            class: "mt-2"
+          }, null, 8, ["modelValue"]),
+          _createVNode(_component_VAlert, {
+            type: "info",
+            variant: "tonal",
+            density: "compact",
+            class: "mt-2"
+          }, {
+            default: _withCtx(() => [...(_cache[23] || (_cache[23] = [
+              _createTextVNode(" 查重只做盘点，不会自动删除文件；勾选后才会移动到隔离目录，保留原相对路径，可随时一键还原。 建议隔离目录与音乐目录在同一磁盘，避免跨盘搬移。 ", -1)
+            ]))]),
+            _: 1
+          }),
           _createVNode(_component_VAlert, {
             type: "info",
             variant: "tonal",
             density: "compact",
             class: "mt-4"
           }, {
-            default: _withCtx(() => [...(_cache[21] || (_cache[21] = [
+            default: _withCtx(() => [...(_cache[24] || (_cache[24] = [
               _createTextVNode(" 插件只写音频文件的标签与同名 .lrc 歌词，不重命名、不移动、不删除；默认「只补空缺」， 勾选覆盖才会改写已有内容。试跑只扫描不写入。 ", -1)
             ]))]),
             _: 1
@@ -489,9 +532,9 @@ return (_ctx, _cache) => {
               _createVNode(_component_VSpacer),
               _createVNode(_component_VBtn, {
                 variant: "text",
-                onClick: _cache[19] || (_cache[19] = $event => (emit('close')))
+                onClick: _cache[21] || (_cache[21] = $event => (emit('close')))
               }, {
-                default: _withCtx(() => [...(_cache[22] || (_cache[22] = [
+                default: _withCtx(() => [...(_cache[25] || (_cache[25] = [
                   _createTextVNode("关闭", -1)
                 ]))]),
                 _: 1
@@ -502,7 +545,7 @@ return (_ctx, _cache) => {
                 loading: saving.value,
                 onClick: save
               }, {
-                default: _withCtx(() => [...(_cache[23] || (_cache[23] = [
+                default: _withCtx(() => [...(_cache[26] || (_cache[26] = [
                   _createTextVNode("保存配置", -1)
                 ]))]),
                 _: 1

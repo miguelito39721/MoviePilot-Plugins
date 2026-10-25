@@ -19,11 +19,12 @@ class MusicTagScraper(_PluginBase):
     plugin_desc = (
         "按目录扫描本地音乐，使用豆瓣音乐 / MusicBrainz / TheAudioDB 多源补全标题、艺人、专辑、年份、"
         "曲序与流派，并通过 LRCLIB / AMLL 写入同名歌词（可带 LRC 头部信息），同时补齐内嵌封面与"
-        "专辑目录 cover.jpg/folder.jpg；试跑结果可勾选执行，失败条目可单条重试，首页提供处理仪表板；"
-        "默认只补空缺，不重命名、不移动、不删除文件。"
+        "专辑目录 cover.jpg/folder.jpg；支持按文件内容与曲目身份查重，重复项可移入隔离目录并一键还原；"
+        "试跑结果可勾选执行，失败条目可单条重试，首页提供处理仪表板；默认只补空缺，不重命名、"
+        "不删除文件，查重不自动搬移。"
     )
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/163music_A.png"
-    plugin_version = "1.2.1"
+    plugin_version = "1.3.1"
     plugin_label = "音乐,标签,歌词"
     plugin_author = "miguelito39721"
     plugin_config_prefix = "musictagscraper_"
@@ -183,6 +184,43 @@ class MusicTagScraper(_PluginBase):
             return {"cleared": 0, "message": "引擎未初始化"}
         return self._engine.clear_records()
 
+    def engine_duplicates(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """扫描重复文件：完全重复与同曲不同版本（只读，不移动文件）。"""
+        if self._engine is None:
+            return {"success": False, "message": "引擎未初始化", "groups": [], "stats": {}}
+        data = payload or {}
+        try:
+            if data.get("wait"):
+                return {"success": True, **self._engine.detect_duplicates(data)}
+            return {"success": True, **self._engine.start_dedupe(data)}
+        except Exception as err:  # noqa: BLE001
+            logger.error(f"音乐标签刮削：查重失败：{err}")
+            return {"success": False, "message": str(err), "groups": [], "stats": {}}
+
+    def engine_duplicates_result(self) -> Dict[str, Any]:
+        """返回查重任务状态与最近一次扫描结果。"""
+        if self._engine is None:
+            return {"success": False, "message": "引擎未初始化", "running": False, "result": {}}
+        return {"success": True, **self._engine.dedupe_snapshot()}
+
+    def engine_quarantine(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """把选中的重复文件移入隔离目录，可随时还原。"""
+        if self._engine is None:
+            return {"moved": 0, "failed": [], "message": "引擎未初始化"}
+        data = payload or {}
+        paths = [str(item) for item in (data.get("paths") or []) if str(item or "").strip()]
+        if not paths:
+            return {"moved": 0, "failed": [], "message": "未选择需要隔离的文件"}
+        return self._engine.quarantine_files(paths)
+
+    def engine_restore_quarantine(self, payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """把隔离目录中的文件还原到原路径。"""
+        if self._engine is None:
+            return {"restored": 0, "failed": [], "message": "引擎未初始化"}
+        data = payload or {}
+        paths = [str(item) for item in (data.get("paths") or []) if str(item or "").strip()]
+        return self._engine.restore_quarantine(paths or None)
+
     # -------------------------------------------------------------- 仪表板
 
     def get_dashboard_meta(self) -> Optional[List[Dict[str, str]]]:
@@ -210,7 +248,7 @@ class MusicTagScraper(_PluginBase):
                     self._dash_card("今日更新", str(today.get("updated", 0)), "mdi-music-note", 6, 3),
                     self._dash_card("今日歌词", str(today.get("lyrics", 0)), "mdi-text-box-outline", 6, 3),
                     self._dash_card("今日目录封面", str(today.get("folder_cover", 0)), "mdi-image-outline", 6, 3),
-                    self._dash_card("失败条目", str(data.get("failure_count", 0)), "mdi-alert-circle-outline", 6, 3),
+                    self._dash_card("重复隔离", str(data.get("quarantined_count", 0)), "mdi-content-duplicate", 6, 3),
                 ],
             }
         ]
@@ -251,7 +289,11 @@ class MusicTagScraper(_PluginBase):
             {
                 "component": "div",
                 "props": {"class": "text-caption text-medium-emphasis mt-1"},
-                "text": f"累计处理音频 {data.get('processed_total', 0)} 个",
+                "text": (
+                    f"累计处理音频 {data.get('processed_total', 0)} 个 ｜ "
+                    f"失败 {data.get('failure_count', 0)} 个 ｜ "
+                    f"上次查重 {((data.get('dedupe') or {}).get('groups') or 0)} 组"
+                ),
             }
         )
         return cols, attrs, content

@@ -57,4 +57,32 @@ def build_api_routes(owner: Any) -> List[Dict[str, Any]]:
             "auth": "bear",
             "summary": "清空处理记录与失败清单",
         },
+        {
+            "path": "/duplicates",
+            "endpoint": owner.engine_duplicates,
+            "methods": ["POST"],
+            "auth": "bear",
+            "summary": "扫描重复音频：完全重复与同曲不同版本（只读）",
+        },
+        {
+            "path": "/duplicates/result",
+            "endpoint": owner.engine_duplicates_result,
+            "methods": ["POST"],
+            "auth": "bear",
+            "summary": "读取后台查重任务状态与最近结果",
+        },
+        {
+            "path": "/duplicates/quarantine",
+            "endpoint": owner.engine_quarantine,
+            "methods": ["POST"],
+            "auth": "bear",
+            "summary": "把选中的重复文件移入隔离目录（可还原）",
+        },
+        {
+            "path": "/duplicates/restore",
+            "endpoint": owner.engine_restore_quarantine,
+            "methods": ["POST"],
+            "auth": "bear",
+            "summary": "把隔离目录中的文件还原到原路径",
+        },
     ]
