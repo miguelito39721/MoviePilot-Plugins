@@ -80,5 +80,22 @@
       "v0.7.10": "修复分集取数为空时订阅反复进出待定的问题，并忽略非正总集数，避免产生虚假变化信号",
       "v0.7.9": "修复剧集组订阅的播出窗口季号过滤，按剧集组分集范围计算下一集、未来集和未知尾集"
     }
+  },
+
+"MusicTagScraper": {
+  "name": "音乐标签刮削",
+  "description": "按目录扫描本地音乐，使用豆瓣音乐 / MusicBrainz / TheAudioDB 多源补全标签，并通过 LRCLIB / AMLL 写入歌词与封面，同时补齐专辑目录 cover.jpg/folder.jpg；试跑可勾选执行，失败可单条重试，首页提供处理仪表板。默认只补空缺，不重命名、不移动、不删除文件。",
+  "labels": "音乐,标签,歌词",
+  "version": "1.2.0",
+  "icon": "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/163music_A.png",
+  "author": "miguelito39721",
+  "level": 1,
+  "release": true,
+  "system_version": ">=3.1.0",
+  "history": {
+    "v1.2.0": "新增专辑目录封面（cover.jpg / folder.jpg，在线封面优先，缺失时提取音频内嵌封面，不覆盖已有图片）；试跑结果按专辑分组并支持勾选执行；歌词写入 LRC 头部元信息 [ti:][ar:][al:]；失败条目支持单条重试；首页新增处理仪表板与今日统计。",
+    "v1.0.1": "修正插件图标地址；专辑名可从「艺人 - 专辑 (年份)」目录名推断，曲名自动清理曲序号与方括号标记。",
+    "v1.0.0": "初始版本：多源标签补全、歌词写入、封面补齐、试跑预览、失败重试与定时补全。"
   }
+}
 }
