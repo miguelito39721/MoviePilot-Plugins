@@ -65,7 +65,7 @@ class SeedStats(_PluginBase):
     plugin_icon = (
         "https://raw.githubusercontent.com/jxxghp/MoviePilot-Frontend/refs/heads/v2/src/assets/images/misc/statistic.png"
     )
-    plugin_version = "1.6.0"
+    plugin_version = "1.6.1"
     plugin_label = "站点,做种,统计"
     plugin_author = "miguelito39721"
     plugin_config_prefix = "seedstats_"
@@ -113,15 +113,28 @@ class SeedStats(_PluginBase):
 
     @staticmethod
     def get_command() -> List[Dict[str, Any]]:
-        """返回插件远程命令列表（/保种统计 输出当前缓存汇总）。"""
+        """返回插件远程命令列表（输出当前缓存汇总）。
+
+        Telegram 菜单只接受小写字母、数字与下划线，中文命令会让整份菜单注册失败，
+        因此中文命令保留可用但隐藏，菜单入口改用 ASCII 别名。
+        """
+        data = {"action": "seedstats_summary"}
         return [
             {
                 "cmd": "/保种统计",
                 "event": EventType.PluginAction,
                 "desc": "站点保种统计汇总",
                 "category": "",
-                "data": {"action": "seedstats_summary"},
-            }
+                "show": False,
+                "data": data,
+            },
+            {
+                "cmd": "/seedstats",
+                "event": EventType.PluginAction,
+                "desc": "站点保种统计汇总",
+                "category": "",
+                "data": data,
+            },
         ]
 
     @eventmanager.register(EventType.PluginAction)
