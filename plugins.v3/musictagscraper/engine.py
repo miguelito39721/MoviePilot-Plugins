@@ -479,9 +479,18 @@ class MusicTagEngine:
         """判断是否仍需要为该目录补写封面文件。"""
         if not self._config.get("write_folder_cover"):
             return False
+        if self._is_music_root(directory):
+            return False
         if self._existing_folder_cover(directory) is not None:
             return False
         return True
+
+    def _is_music_root(self, directory: Path) -> bool:
+        """判断目录是否为配置的音乐根目录，避免把封面写到音乐库根上。"""
+        roots = {
+            str(Path(str(item)).expanduser()) for item in (self._config.get("music_dirs") or [])
+        }
+        return str(directory) in roots
 
     def _ensure_folder_cover(
         self,
@@ -494,6 +503,8 @@ class MusicTagEngine:
             return False, "disabled"
         if not directory.is_dir():
             return False, "missing_dir"
+        if self._is_music_root(directory):
+            return False, "music_root"
         existing = self._existing_folder_cover(directory)
         if existing is not None and not self._config.get("overwrite"):
             return False, "exists"

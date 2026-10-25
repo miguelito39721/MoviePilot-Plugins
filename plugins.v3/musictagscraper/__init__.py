@@ -23,7 +23,7 @@ class MusicTagScraper(_PluginBase):
         "默认只补空缺，不重命名、不移动、不删除文件。"
     )
     plugin_icon = "https://raw.githubusercontent.com/jxxghp/MoviePilot-Plugins/main/icons/163music_A.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.2.1"
     plugin_label = "音乐,标签,歌词"
     plugin_author = "miguelito39721"
     plugin_config_prefix = "musictagscraper_"
